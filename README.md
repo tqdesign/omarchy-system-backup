@@ -116,3 +116,7 @@ python3 -m unittest test_omarchy_backup
 Early. The whole-system restore has not been tested on real hardware yet.
 Restore onto a spare drive once before you rely on it. A backup only protects
 you if the restore works.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
