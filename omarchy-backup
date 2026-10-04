@@ -113,6 +113,22 @@ def mount_source(path):
     return out.split("[", 1)[0]
 
 
+def existing_ancestor(path):
+    """path itself, or its nearest parent that exists (the backup folder may not yet)."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def backup_drive_mounted(dest):
+    """True if dest is (or would be) on a mounted btrfs drive other than the system drive."""
+    where = existing_ancestor(dest)
+    source = mount_source(where)
+    fstype = run(["findmnt", "-no", "FSTYPE", "--target", where], check=False).strip()
+    return bool(source) and source != mount_source("/") and fstype == "btrfs"
+
+
 def disks_of(device):
     """Whole disks (or loop devices) underneath a block device."""
     out = run(["lsblk", "-sno", "PATH,TYPE", device], check=False)
@@ -301,11 +317,8 @@ def backup(cfg):
         raise BackupError("another backup is already running")
 
     root_dev = mount_source("/")
-    dest_dev = mount_source(dest.parent if not dest.exists() else dest)
-    if not dest_dev or not Path(dest_dev).exists():
-        raise BackupError(f"the backup drive for {dest} is not mounted")
-    if dest_dev == root_dev:
-        raise BackupError(f"{dest} is on the system drive (is the backup drive mounted?)")
+    if not backup_drive_mounted(dest):
+        raise BackupError(f"{dest} is not on a mounted backup drive (it would land on the system drive)")
 
     snapshots_dest.mkdir(parents=True, exist_ok=True)
     dest.chmod(0o700)
@@ -791,15 +804,16 @@ class UI:
         else:
             lines.append(("Last backup:  never", self.warn))
         stamps = complete_stamps(self.dest / "snapshots")
-        try:
-            free = shutil.disk_usage(self.dest).free
-            lines.append((f"Backups:      {len(stamps)} in {self.dest}  ·  {human_bytes(free)} free", 0))
-        except OSError:
-            lines.append((f"Backups:      {self.dest} not found", self.warn))
+        if backup_drive_mounted(self.dest):
+            free = shutil.disk_usage(existing_ancestor(self.dest)).free
+            count = f"{len(stamps)} in {self.dest}" if stamps else f"none yet in {self.dest}"
+            lines.append((f"Backups:      {count}  ·  {human_bytes(free)} free", 0))
+        else:
+            lines.append((f"Backups:      backup drive for {self.dest} not mounted", self.bad))
         state = schedule_state()
         sched = f"nightly at {self.cfg['time']}" if state == "on" else state
         lines.append((f"Schedule:     {sched}", self.good if state == "on" else self.warn))
-        device, _ = backup_drive(self.dest) if self.dest.exists() else (None, None)
+        device, _ = backup_drive(existing_ancestor(self.dest)) if backup_drive_mounted(self.dest) else (None, None)
         if device:
             if keyslot_count(device) >= 2:
                 lines.append(("Drive password: set", self.good))
@@ -814,7 +828,7 @@ class UI:
         while True:
             have_backups = bool(complete_stamps(self.dest / "snapshots"))
             items = [
-                ("Back up now", "backup", "" if self.dest.parent.exists() else "backup drive not found"),
+                ("Back up now", "backup", "" if backup_drive_mounted(self.dest) else "backup drive not mounted"),
                 ("Browse backups", "browse", "" if have_backups else "none yet"),
                 ("Restore a file or folder", "files", "" if have_backups else "none yet"),
                 ("Restore whole system onto a new drive", "system", "" if have_backups else "none yet"),
@@ -998,7 +1012,7 @@ class UI:
                 self.message("Schedule", [f"{at!r} is not a time like 03:00."], self.warn)
 
     def screen_setup(self):
-        device, key_file = backup_drive(self.dest) if self.dest.exists() or self.dest.parent.exists() else (None, None)
+        device, key_file = backup_drive(existing_ancestor(self.dest)) if backup_drive_mounted(self.dest) else (None, None)
         items = [("Install / update the program and nightly schedule", "install")]
         if device:
             label = "Add a password to the backup drive" if keyslot_count(device) < 2 else "Add another password to the backup drive"

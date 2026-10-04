@@ -103,6 +103,13 @@ class RestorePathTests(unittest.TestCase):
             self.assertFalse((live / "extra.txt").exists())
 
 
+class PathTests(unittest.TestCase):
+    def test_existing_ancestor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(B.existing_ancestor(Path(tmp, "a", "b")), Path(tmp))
+            self.assertEqual(B.existing_ancestor(tmp), Path(tmp))
+
+
 class UnitFileTests(unittest.TestCase):
     def test_timer_and_service(self):
         self.assertIn("OnCalendar=*-*-* 03:00:00", B.timer_text("03:00"))
