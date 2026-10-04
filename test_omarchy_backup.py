@@ -17,7 +17,7 @@ UUID=old-root\t/\tbtrfs\trw,relatime,compress=zstd:3,ssd,space_cache=v2,subvol=/
 UUID=old-root\t/home\tbtrfs\trw,relatime,subvol=/@home\t0 0
 UUID=old-root\t/var/cache/pacman/pkg\tbtrfs\trw,subvol=/@pkg\t0 0
 UUID=old-root\t/var/log\tbtrfs\trw,subvol=/@log\t0 0
-UUID=627C-78C3\t/boot\tvfat\trw,relatime\t0 2
+UUID=ABCD-1234\t/boot\tvfat\trw,relatime\t0 2
 UUID=data-fs\t/data\tbtrfs\trw,nofail\t0 0
 /swap/swapfile none swap defaults,pri=0 0 0
 """
