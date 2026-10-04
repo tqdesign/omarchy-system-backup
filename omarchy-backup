@@ -1,0 +1,1102 @@
+#!/usr/bin/env python3
+"""Omarchy System Backup.
+
+Backs up the btrfs subvolumes for / and /home to a second drive and restores
+them: single files and folders, or the whole system onto a new drive (run
+from an Omarchy/Arch live USB).
+
+Run with no arguments for the menu. Subcommands are for the nightly timer and
+for testing: run, list, restore-system.
+"""
+
+import argparse
+import curses
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP = "omarchy-backup"
+INSTALL_PATH = Path("/usr/local/bin") / APP
+CONFIG_PATH = Path("/etc/omarchy-backup.json")
+SERVICE_PATH = Path("/etc/systemd/system/omarchy-backup.service")
+TIMER_PATH = Path("/etc/systemd/system/omarchy-backup.timer")
+LOCK_PATH = Path("/run/lock/omarchy-backup.lock")
+WORK = Path("/run/omarchy-backup")
+POOL = WORK / "pool"
+
+DEFAULTS = {
+    "dest": "/data/backups/system",
+    "time": "03:00",
+    "keep_daily": 7,
+    "keep_weekly": 4,
+    "keep_monthly": 6,
+}
+
+# Subvolume name -> where it is mounted. Only these are backed up; @pkg, @log
+# and the nested /.snapshots and /swap subvolumes are recreated empty.
+SUBVOLUMES = {"@": "/", "@home": "/home"}
+LOCAL_SNAPSHOT_DIR = "@omarchy-backup"
+STAMP_FORMAT = "%Y%m%dT%H%M%S"
+STAMP_RE = re.compile(r"^\d{8}T\d{6}$")
+
+ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+LUKS_TYPE = "CA7D7CCB-63ED-4C53-861C-1742536059CC"
+
+
+class BackupError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def run(cmd, check=True, capture=True, **kwargs):
+    """Run a command. With capture, return its stdout as text."""
+    result = subprocess.run(
+        [str(c) for c in cmd],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        **kwargs,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or "").strip() if capture else ""
+        raise BackupError(f"{' '.join(str(c) for c in cmd)} failed" + (f": {detail}" if detail else ""))
+    return (result.stdout or "") if capture else ""
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def step(msg):
+    say(f"\n==> {msg}")
+
+
+def human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("OMARCHY_BACKUP_DEST"):
+        cfg["dest"] = os.environ["OMARCHY_BACKUP_DEST"]
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def mount_source(path):
+    """Block device behind a path, without the [/subvol] suffix."""
+    out = run(["findmnt", "-no", "SOURCE", "--target", path], check=False).strip()
+    return out.split("[", 1)[0]
+
+
+def disks_of(device):
+    """Whole disks (or loop devices) underneath a block device."""
+    out = run(["lsblk", "-sno", "PATH,TYPE", device], check=False)
+    disks = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in ("disk", "loop"):
+            disks.append(parts[0])
+    return disks
+
+
+def stamp_label(stamp):
+    try:
+        when = dt.datetime.strptime(stamp, STAMP_FORMAT)
+    except ValueError:
+        return stamp
+    today = dt.date.today()
+    if when.date() == today:
+        day = "Today"
+    elif when.date() == today - dt.timedelta(days=1):
+        day = "Yesterday"
+    else:
+        day = when.strftime("%a %b %-d %Y")
+    return f"{day} {when.strftime('%H:%M')}"
+
+
+# ---------------------------------------------------------------------------
+# Backups on disk
+# ---------------------------------------------------------------------------
+
+
+def stamps_for(directory, subvolume):
+    pattern = re.compile(rf"^{re.escape(subvolume)}\.(\d{{8}}T\d{{6}})$")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return set()
+    return {m.group(1) for name in names if (m := pattern.match(name))}
+
+
+def complete_stamps(snapshot_dir):
+    """Backup times that have every subvolume, newest first."""
+    sets = [stamps_for(snapshot_dir, sub) for sub in SUBVOLUMES]
+    return sorted(set.intersection(*sets), reverse=True) if sets else []
+
+
+def received_ok(path):
+    """True if a received subvolume finished (btrfs sets Received UUID at the end)."""
+    out = run(["btrfs", "subvolume", "show", path], check=False)
+    match = re.search(r"Received UUID:\s+(\S+)", out)
+    return bool(match and match.group(1) != "-")
+
+
+def stamps_to_keep(stamps, daily, weekly, monthly):
+    """Newest backup per day/week/month, for the newest N of each; always the latest."""
+    ordered = sorted(stamps, reverse=True)
+    if not ordered:
+        return set()
+    keep = {ordered[0]}
+    buckets = (
+        (daily, lambda d: d.date()),
+        (weekly, lambda d: d.isocalendar()[:2]),
+        (monthly, lambda d: (d.year, d.month)),
+    )
+    for limit, key_of in buckets:
+        seen = []
+        for stamp in ordered:
+            key = key_of(dt.datetime.strptime(stamp, STAMP_FORMAT))
+            if key in seen:
+                continue
+            if len(seen) >= limit:
+                break
+            seen.append(key)
+            keep.add(stamp)
+    return keep
+
+
+def read_status(dest):
+    try:
+        return json.loads((Path(dest) / "last-run.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_status(dest, started, result, message):
+    path = Path(dest) / "last-run.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "started": started,
+        "finished": dt.datetime.now().isoformat(timespec="seconds"),
+        "result": result,
+        "message": message,
+    }) + "\n")
+    os.replace(tmp, path)
+    path.chmod(0o644)
+
+
+# ---------------------------------------------------------------------------
+# Back up
+# ---------------------------------------------------------------------------
+
+
+def copy_subvolume(snapshot, parent, dest_dir, label):
+    """btrfs send | btrfs receive, printing how much has been copied."""
+    send_cmd = ["btrfs", "send", "-q"] + (["-p", str(parent)] if parent else []) + [str(snapshot)]
+    send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
+    recv = subprocess.Popen(["btrfs", "receive", "-q", str(dest_dir)], stdin=subprocess.PIPE)
+    copied = 0
+    started = last_print = time.monotonic()
+    try:
+        while chunk := send.stdout.read(1 << 20):
+            recv.stdin.write(chunk)
+            copied += len(chunk)
+            now = time.monotonic()
+            if now - last_print >= 1:
+                rate = copied / max(now - started, 0.001)
+                print(f"\r   {label}: {human_bytes(copied)} copied ({human_bytes(rate)}/s)   ", end="", flush=True)
+                last_print = now
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            recv.stdin.close()
+        except BrokenPipeError:
+            pass
+    send_code = send.wait()
+    recv_code = recv.wait()
+    print(f"\r   {label}: {human_bytes(copied)} copied{' ' * 20}", flush=True)
+    if send_code or recv_code:
+        raise BackupError(f"copying {label} failed (send {send_code}, receive {recv_code})")
+    return copied
+
+
+def save_restore_kit(dest):
+    """Extra files restore needs once the system drive is gone."""
+    dest = Path(dest)
+    meta = dest / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+
+    if Path("/boot").is_dir():
+        (dest / "boot").mkdir(exist_ok=True)
+        run(["rsync", "-a", "--delete", "/boot/", f"{dest / 'boot'}/"])
+
+    root_dev = mount_source("/")
+    disks = disks_of(root_dev)
+    if disks:
+        (meta / "root-disk.sfdisk").write_text(run(["sfdisk", "-d", disks[0]], check=False))
+    (meta / "lsblk.txt").write_text(run(["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,UUID,PARTUUID,MOUNTPOINTS"], check=False))
+    swapfile = Path("/swap/swapfile")
+    (meta / "swapfile-bytes").write_text(str(swapfile.stat().st_size if swapfile.exists() else 0))
+    (meta / "packages.txt").write_text(run(["pacman", "-Qqe"], check=False))
+
+    # The program itself, next to the backups, so restore day only needs this drive.
+    me = Path(__file__).resolve()
+    kit = dest.parent / APP
+    if me != kit.resolve():
+        shutil.copy2(me, kit)
+    kit.chmod(0o755)
+    (dest.parent / "HOW-TO-RESTORE.txt").write_text(RESTORE_HELP)
+
+
+RESTORE_HELP = """\
+Omarchy System Backup: restoring after the system drive died
+=============================================================
+
+1. Fit the new drive. Start the laptop from an Omarchy or Arch USB stick.
+2. Unlock and mount this backup drive (replace nvme0n1p1 with yours, see lsblk):
+     cryptsetup open /dev/nvme0n1p1 backup
+     mkdir -p /mnt/backup && mount /dev/mapper/backup /mnt/backup
+3. Start the program and pick "Restore whole system":
+     python3 /mnt/backup/backups/omarchy-backup
+   (If python3 is missing: pacman -Sy python)
+"""
+
+
+def backup(cfg):
+    """One backup run. Prints progress; raises BackupError on failure."""
+    dest = Path(cfg["dest"])
+    snapshots_dest = dest / "snapshots"
+    started = dt.datetime.now().isoformat(timespec="seconds")
+
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise BackupError("another backup is already running")
+
+    root_dev = mount_source("/")
+    dest_dev = mount_source(dest.parent if not dest.exists() else dest)
+    if not dest_dev or not Path(dest_dev).exists():
+        raise BackupError(f"the backup drive for {dest} is not mounted")
+    if dest_dev == root_dev:
+        raise BackupError(f"{dest} is on the system drive (is the backup drive mounted?)")
+
+    snapshots_dest.mkdir(parents=True, exist_ok=True)
+    dest.chmod(0o700)
+    POOL.mkdir(parents=True, exist_ok=True)
+    run(["mount", "-o", "subvolid=5,noatime", root_dev, POOL])
+    try:
+        local = POOL / LOCAL_SNAPSHOT_DIR
+        local.mkdir(exist_ok=True)
+        stamp = dt.datetime.now().strftime(STAMP_FORMAT)
+
+        step("Taking snapshots")
+        for sub in SUBVOLUMES:
+            run(["btrfs", "subvolume", "snapshot", "-r", POOL / sub, local / f"{sub}.{stamp}"])
+        run(["btrfs", "filesystem", "sync", POOL])
+
+        step(f"Copying to {snapshots_dest}")
+        for sub in SUBVOLUMES:
+            parents = sorted(
+                (s for s in stamps_for(local, sub) & stamps_for(snapshots_dest, sub) if s < stamp),
+                reverse=True,
+            )
+            parent = next((s for s in parents if received_ok(snapshots_dest / f"{sub}.{s}")), None)
+            target = snapshots_dest / f"{sub}.{stamp}"
+            try:
+                copy_subvolume(local / f"{sub}.{stamp}", local / f"{sub}.{parent}" if parent else None,
+                               snapshots_dest, f"{SUBVOLUMES[sub]} ({'changes only' if parent else 'full copy'})")
+            except BaseException:
+                if target.exists():
+                    run(["btrfs", "subvolume", "delete", target], check=False)
+                raise
+
+        step("Cleaning up old snapshots")
+        for sub in SUBVOLUMES:
+            for old in stamps_for(local, sub) - {stamp}:
+                run(["btrfs", "subvolume", "delete", local / f"{sub}.{old}"], check=False)
+        keep = stamps_to_keep(complete_stamps(snapshots_dest), cfg["keep_daily"], cfg["keep_weekly"], cfg["keep_monthly"])
+        for sub in SUBVOLUMES:
+            for old in stamps_for(snapshots_dest, sub) - keep:
+                say(f"   removing {sub}.{old}")
+                run(["btrfs", "subvolume", "delete", snapshots_dest / f"{sub}.{old}"], check=False)
+    finally:
+        run(["umount", POOL], check=False)
+
+    step("Saving /boot and restore information")
+    save_restore_kit(dest)
+    write_status(dest, started, "ok", "backup complete")
+    say(f"\nBackup {stamp_label(stamp)} finished.")
+    lock.close()
+
+
+def backup_logged(cfg):
+    started = dt.datetime.now().isoformat(timespec="seconds")
+    try:
+        backup(cfg)
+        return 0
+    except (BackupError, KeyboardInterrupt) as err:
+        message = "cancelled" if isinstance(err, KeyboardInterrupt) else str(err)
+        say(f"\nBackup failed: {message}")
+        if Path(cfg["dest"]).is_dir():
+            write_status(cfg["dest"], started, "failed", message)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Restore files
+# ---------------------------------------------------------------------------
+
+
+def restore_path(source, original, mode):
+    """Copy a file or folder out of a backup. mode: 'replace' or 'copy'."""
+    source = Path(source)
+    original = Path(original)
+    if mode == "copy" and original.exists():
+        suffix = dt.date.today().strftime("restored-%Y%m%d")
+        target = original.with_name(f"{original.name}.{suffix}")
+    else:
+        target = original
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir() and not source.is_symlink():
+        args = ["rsync", "-aHAX", "--ignore-times"] + (["--delete"] if mode == "replace" else []) + [f"{source}/", f"{target}/"]
+    else:
+        args = ["rsync", "-aHAX", "--ignore-times", str(source), str(target)]
+    run(args)
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Restore whole system
+# ---------------------------------------------------------------------------
+
+
+def rewrite_fstab(text, root_uuid, esp_uuid):
+    """Point the btrfs and /boot lines at the new drive; leave the rest alone."""
+    btrfs_mounts = {"/", "/home", "/var/cache/pacman/pkg", "/var/log"}
+    lines = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and not line.lstrip().startswith("#"):
+            if fields[1] in btrfs_mounts and fields[2] == "btrfs":
+                line = "\t".join([f"UUID={root_uuid}"] + fields[1:])
+            elif fields[1] == "/boot":
+                line = "\t".join([f"UUID={esp_uuid}"] + fields[1:])
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def set_cryptdevice(text, partuuid):
+    return re.sub(r"cryptdevice=PARTUUID=[^:\s]*:", f"cryptdevice=PARTUUID={partuuid}:", text)
+
+
+def set_resume_offset(text, offset):
+    return re.sub(r"resume_offset=\d+", f"resume_offset={offset}", text)
+
+
+def partition_path(disk, number):
+    return f"{disk}p{number}" if disk[-1].isdigit() else f"{disk}{number}"
+
+
+def busy_disks(devices):
+    """Disks under anything mounted, used as swap, or unlocked (from a flat lsblk list)."""
+    busy = set()
+    for dev in devices:
+        if any(dev.get("mountpoints") or []) or dev.get("type") == "crypt":
+            busy.update(disks_of(dev["path"]))
+    return busy
+
+
+def candidate_disks(backup_dir, allow_loop=False):
+    """Disks that could be restored onto: (path, label, reason-if-not-allowed)."""
+    devices = json.loads(run(["lsblk", "-J", "--list", "-b", "-o", "PATH,SIZE,MODEL,TYPE,MOUNTPOINTS"]))["blockdevices"]
+    backup_disks = set(disks_of(mount_source(backup_dir)))
+    busy = busy_disks(devices)
+    out = []
+    for dev in devices:
+        if dev["type"] not in ("disk", "loop") or (dev["type"] == "loop" and not allow_loop):
+            continue
+        if not dev.get("size") or dev["path"].startswith("/dev/zram"):
+            continue
+        label = f"{dev['path']}  {human_bytes(dev['size'])}  {(dev.get('model') or '').strip()}"
+        reason = ""
+        if dev["path"] in backup_disks:
+            reason = "holds the backup"
+        elif dev["path"] in busy:
+            reason = "in use"
+        out.append((dev["path"], label, reason))
+    return out
+
+
+def restore_system(backup_dir, stamp, target, efi_register=True, luks_key_file=None):
+    """Erase target and rebuild a bootable system from one backup. Interactive for passwords."""
+    backup_dir = Path(backup_dir)
+    snaps = backup_dir / "snapshots"
+    for sub in SUBVOLUMES:
+        if not (snaps / f"{sub}.{stamp}").is_dir():
+            raise BackupError(f"backup {stamp} is missing {sub}")
+    for cmd in ("cryptsetup", "sfdisk", "wipefs", "mkfs.fat", "mkfs.btrfs", "btrfs", "rsync", "arch-chroot", "blkid"):
+        if not shutil.which(cmd):
+            raise BackupError(f"missing {cmd}; run this from an Omarchy or Arch live USB")
+    if target in disks_of(mount_source(backup_dir)):
+        raise BackupError(f"{target} holds the backup itself")
+    devices = json.loads(run(["lsblk", "-J", "--list", "-o", "PATH,TYPE,MOUNTPOINTS"]))["blockdevices"]
+    if target in busy_disks(devices):
+        raise BackupError(f"{target} is in use (mounted or unlocked); refusing to erase it")
+
+    esp = partition_path(target, 1)
+    luks = partition_path(target, 2)
+    mapper = "omarchy-restore-root"
+    top = WORK / "restore-top"
+    sysroot = WORK / "restore-sys"
+    mounts = []
+
+    def mount(*args):
+        run(["mount", *args])
+        mounts.append(args[-1])
+
+    try:
+        step(f"Partitioning {target}")
+        run(["wipefs", "-aq", target])
+        run(["sfdisk", "-q", target], input=(
+            "label: gpt\n"
+            f'size=2GiB, type={ESP_TYPE}, name="EFI"\n'
+            f'type={LUKS_TYPE}, name="root"\n'
+        ))
+        run(["partprobe", target], check=False)
+        run(["udevadm", "settle"], check=False)
+        run(["mkfs.fat", "-F", "32", "-n", "BOOT", esp])
+
+        step("Encrypting the new drive")
+        if luks_key_file:
+            run(["cryptsetup", "luksFormat", "--type", "luks2", "--batch-mode", "--key-file", luks_key_file, luks])
+            run(["cryptsetup", "open", "--key-file", luks_key_file, luks, mapper])
+        else:
+            say("Choose the password you will type when the laptop starts.")
+            run(["cryptsetup", "luksFormat", "--type", "luks2", "--verify-passphrase", luks], capture=False)
+            say("Type it once more to unlock the new drive:")
+            run(["cryptsetup", "open", luks, mapper], capture=False)
+        run(["mkfs.btrfs", "-q", "-f", f"/dev/mapper/{mapper}"])
+        run(["udevadm", "settle"], check=False)
+
+        top.mkdir(parents=True, exist_ok=True)
+        mount("-o", "subvolid=5,compress=zstd:3", f"/dev/mapper/{mapper}", top)
+        for sub, where in SUBVOLUMES.items():
+            step(f"Copying {where} from the backup (the slow part)")
+            copy_subvolume(snaps / f"{sub}.{stamp}", None, top, where)
+            run(["btrfs", "subvolume", "snapshot", top / f"{sub}.{stamp}", top / sub])
+            run(["btrfs", "subvolume", "delete", top / f"{sub}.{stamp}"])
+        for sub in ("@pkg", "@log"):
+            run(["btrfs", "subvolume", "create", top / sub])
+
+        step("Recreating /.snapshots and swap")
+        for nested in (".snapshots", "swap"):
+            path = top / "@" / nested
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+            if not path.exists():
+                run(["btrfs", "subvolume", "create", path])
+        (top / "@" / ".snapshots").chmod(0o750)
+        try:
+            swap_bytes = int((backup_dir / "meta" / "swapfile-bytes").read_text().strip())
+        except (OSError, ValueError):
+            swap_bytes = 0
+        if swap_bytes > 0:
+            run(["btrfs", "filesystem", "mkswapfile", "--size", f"{swap_bytes // 1048576}m", top / "@" / "swap" / "swapfile"])
+
+        opts = "rw,relatime,compress=zstd:3,ssd,space_cache=v2"
+        sysroot.mkdir(parents=True, exist_ok=True)
+        mount("-o", f"{opts},subvol=@", f"/dev/mapper/{mapper}", sysroot)
+        mount("-o", f"{opts},subvol=@home", f"/dev/mapper/{mapper}", sysroot / "home")
+        for sub, where in (("@pkg", "var/cache/pacman/pkg"), ("@log", "var/log")):
+            (sysroot / where).mkdir(parents=True, exist_ok=True)
+            mount("-o", f"{opts},subvol={sub}", f"/dev/mapper/{mapper}", sysroot / where)
+        (sysroot / "boot").mkdir(exist_ok=True)
+        mount(esp, sysroot / "boot")
+
+        step("Restoring /boot")
+        if (backup_dir / "boot").is_dir():
+            run(["rsync", "-rt", "--delete", f"{backup_dir / 'boot'}/", f"{sysroot / 'boot'}/"])
+
+        step("Pointing the restored system at the new drive")
+        root_uuid = run(["blkid", "-s", "UUID", "-o", "value", f"/dev/mapper/{mapper}"]).strip()
+        esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp]).strip()
+        partuuid = run(["blkid", "-s", "PARTUUID", "-o", "value", luks]).strip()
+        fstab = sysroot / "etc" / "fstab"
+        shutil.copy2(fstab, fstab.with_name("fstab.before-restore"))
+        fstab.write_text(rewrite_fstab(fstab.read_text(), root_uuid, esp_uuid))
+        limine_default = sysroot / "etc" / "default" / "limine"
+        if limine_default.exists():
+            limine_default.write_text(set_cryptdevice(limine_default.read_text(), partuuid))
+        resume_conf = sysroot / "etc" / "limine-entry-tool.d" / "resume.conf"
+        swapfile = sysroot / "swap" / "swapfile"
+        if resume_conf.exists() and swapfile.exists():
+            offset = run(["btrfs", "inspect-internal", "map-swapfile", "-r", swapfile]).strip()
+            resume_conf.write_text(set_resume_offset(resume_conf.read_text(), offset))
+
+        step("Installing the boot loader and rebuilding the boot image")
+        run(["arch-chroot", sysroot, "limine-install"] + ([] if efi_register else ["--no-efi-register"]), capture=False)
+        run(["arch-chroot", sysroot, "limine-mkinitcpio"], capture=False)
+        say(f"\nRestored {stamp_label(stamp)} onto {target}. Remove the USB stick and restart.")
+    finally:
+        for path in reversed(mounts):
+            run(["umount", "-R", path], check=False)
+        if Path(f"/dev/mapper/{mapper}").exists():
+            run(["cryptsetup", "close", mapper], check=False)
+
+
+# ---------------------------------------------------------------------------
+# Schedule, install, backup drive password
+# ---------------------------------------------------------------------------
+
+
+def timer_text(at):
+    return (
+        "[Unit]\nDescription=Nightly Omarchy system backup\n\n"
+        f"[Timer]\nOnCalendar=*-*-* {at}:00\nPersistent=true\nRandomizedDelaySec=10m\n\n"
+        "[Install]\nWantedBy=timers.target\n"
+    )
+
+
+def service_text(dest):
+    return (
+        "[Unit]\nDescription=Omarchy system backup\n"
+        f"RequiresMountsFor={Path(dest).parent}\n\n"
+        f"[Service]\nType=oneshot\nExecStart={INSTALL_PATH} run\nNice=10\nIOSchedulingClass=idle\n"
+    )
+
+
+def schedule_state():
+    if not TIMER_PATH.exists():
+        return "not installed"
+    enabled = run(["systemctl", "is-enabled", "omarchy-backup.timer"], check=False).strip()
+    return "on" if enabled == "enabled" else "off"
+
+
+def install(cfg):
+    step("Installing omarchy-backup")
+    me = Path(__file__).resolve()
+    if me != INSTALL_PATH:
+        shutil.copy2(me, INSTALL_PATH)
+    INSTALL_PATH.chmod(0o755)
+    if not CONFIG_PATH.exists():
+        save_config(cfg)
+    SERVICE_PATH.write_text(service_text(cfg["dest"]))
+    TIMER_PATH.write_text(timer_text(cfg["time"]))
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", "omarchy-backup.timer"])
+    say(f"Installed. Backups run nightly at {cfg['time']}.")
+
+
+def set_schedule(cfg, enabled=None, at=None):
+    if at:
+        cfg["time"] = at
+        save_config(cfg)
+        TIMER_PATH.write_text(timer_text(at))
+        run(["systemctl", "daemon-reload"])
+    if enabled is True:
+        run(["systemctl", "enable", "--now", "omarchy-backup.timer"])
+    elif enabled is False:
+        run(["systemctl", "disable", "--now", "omarchy-backup.timer"])
+
+
+def backup_drive(dest):
+    """(LUKS partition, key file) for the drive holding dest, if encrypted."""
+    source = mount_source(dest)
+    if not source.startswith("/dev/mapper/"):
+        return None, None
+    name = source.rsplit("/", 1)[-1]
+    status = run(["cryptsetup", "status", name], check=False)
+    match = re.search(r"device:\s+(\S+)", status)
+    device = match.group(1) if match else None
+    key_file = None
+    try:
+        for line in Path("/etc/crypttab").read_text().splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[0] == name and fields[2] not in ("none", "-"):
+                key_file = fields[2]
+    except OSError:
+        pass
+    return device, key_file
+
+
+def keyslot_count(device):
+    dump = run(["cryptsetup", "luksDump", device], check=False)
+    section = dump.split("Keyslots:", 1)[-1].split("Tokens:", 1)[0]
+    return len(re.findall(r"^\s+\d+: luks2", section, re.M))
+
+
+# ---------------------------------------------------------------------------
+# Terminal interface
+# ---------------------------------------------------------------------------
+
+
+class UI:
+    def __init__(self, scr, cfg, allow_loop=False):
+        self.scr = scr
+        self.cfg = cfg
+        self.allow_loop = allow_loop
+        self.opened_backup = None  # mapper name when a backup drive was unlocked here
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for pair, color in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED), 1):
+            curses.init_pair(pair, color, -1)
+        self.accent = curses.color_pair(1) | curses.A_BOLD
+        self.good = curses.color_pair(2)
+        self.warn = curses.color_pair(3)
+        self.bad = curses.color_pair(4)
+
+    @property
+    def dest(self):
+        return Path(self.cfg["dest"])
+
+    # --- drawing primitives ---
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w - 1:
+            self.scr.addnstr(y, x, text, max(0, w - 1 - x), attr)
+
+    def frame(self, title, header=()):
+        self.scr.erase()
+        self.put(0, 2, "Omarchy System Backup", self.accent)
+        self.put(1, 2, title, curses.A_BOLD)
+        y = 3
+        for text, attr in header:
+            self.put(y, 2, text, attr)
+            y += 1
+        return y + (1 if header else 0)
+
+    def menu(self, title, items, header=(), footer="↑↓ move · Enter select · Esc back", index=0):
+        """items: list of (label, value) or (label, value, disabled_reason). Returns value or None."""
+        items = [tuple(i) + ("",) * (3 - len(i)) for i in items]
+        index = min(index, max(0, len(items) - 1))
+        while True:
+            top = self.frame(title, header)
+            h, _ = self.scr.getmaxyx()
+            rows = max(1, h - top - 2)
+            first = max(0, min(index - rows + 1, len(items) - rows)) if index >= rows else 0
+            for row, (label, _value, reason) in enumerate(items[first:first + rows]):
+                i = first + row
+                text = f"{'▸' if i == index else ' '} {label}" + (f"  ({reason})" if reason else "")
+                attr = curses.A_REVERSE if i == index else (curses.A_DIM if reason else 0)
+                self.put(top + row, 2, text, attr)
+            self.put(h - 1, 2, footer, curses.A_DIM)
+            self.scr.refresh()
+            key = self.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                index = (index - 1) % len(items)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                index = (index + 1) % len(items)
+            elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                if not items[index][2]:
+                    return items[index][1]
+            elif key in (27, ord("q"), curses.KEY_LEFT, curses.KEY_BACKSPACE, 127):
+                return None
+
+    def prompt(self, title, question, default=""):
+        text = default
+        curses.curs_set(1)
+        try:
+            while True:
+                top = self.frame(title)
+                self.put(top, 2, question)
+                self.put(top + 2, 2, "> " + text)
+                self.put(self.scr.getmaxyx()[0] - 1, 2, "Enter accept · Esc cancel", curses.A_DIM)
+                self.scr.move(top + 2, min(4 + len(text), self.scr.getmaxyx()[1] - 2))
+                self.scr.refresh()
+                key = self.scr.get_wch()
+                if key in ("\n", "\r", curses.KEY_ENTER):
+                    return text
+                if key == "\x1b":
+                    return None
+                if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    text = text[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    text += key
+        finally:
+            curses.curs_set(0)
+
+    def confirm(self, title, lines, yes="Yes", no="Cancel"):
+        header = [(line, 0) for line in lines]
+        return self.menu(title, [(no, False), (yes, True)], header) is True
+
+    def message(self, title, lines, attr=0):
+        top = self.frame(title)
+        for i, line in enumerate(lines):
+            self.put(top + i, 2, line, attr)
+        self.put(self.scr.getmaxyx()[0] - 1, 2, "Press any key", curses.A_DIM)
+        self.scr.refresh()
+        self.scr.getch()
+
+    def in_terminal(self, title, fn, *args, **kwargs):
+        """Leave the menu and run fn with normal terminal output (and password prompts)."""
+        curses.def_prog_mode()
+        curses.endwin()
+        print(f"\n\033[1m{title}\033[0m")
+        ok = False
+        try:
+            result = fn(*args, **kwargs)
+            ok = result in (None, 0, True)
+        except BackupError as err:
+            print(f"\n\033[31mFailed: {err}\033[0m")
+        except KeyboardInterrupt:
+            print("\n\033[33mCancelled.\033[0m")
+        try:
+            input("\nPress Enter to return to the menu...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+        return ok
+
+    # --- status ---
+
+    def status_lines(self):
+        lines = []
+        status = read_status(self.dest)
+        if status:
+            when = status.get("finished", "")[:16].replace("T", " ")
+            if status.get("result") == "ok":
+                lines.append((f"Last backup:  {when}  ✓", self.good))
+            else:
+                lines.append((f"Last backup:  FAILED {when}: {status.get('message', '')}", self.bad))
+        else:
+            lines.append(("Last backup:  never", self.warn))
+        stamps = complete_stamps(self.dest / "snapshots")
+        try:
+            free = shutil.disk_usage(self.dest).free
+            lines.append((f"Backups:      {len(stamps)} in {self.dest}  ·  {human_bytes(free)} free", 0))
+        except OSError:
+            lines.append((f"Backups:      {self.dest} not found", self.warn))
+        state = schedule_state()
+        sched = f"nightly at {self.cfg['time']}" if state == "on" else state
+        lines.append((f"Schedule:     {sched}", self.good if state == "on" else self.warn))
+        device, _ = backup_drive(self.dest) if self.dest.exists() else (None, None)
+        if device:
+            if keyslot_count(device) >= 2:
+                lines.append(("Drive password: set", self.good))
+            else:
+                lines.append(("Drive password: NOT SET (needed to restore if the system drive dies)", self.warn))
+        return lines
+
+    # --- screens ---
+
+    def main(self):
+        index = 0
+        while True:
+            have_backups = bool(complete_stamps(self.dest / "snapshots"))
+            items = [
+                ("Back up now", "backup", "" if self.dest.parent.exists() else "backup drive not found"),
+                ("Browse backups", "browse", "" if have_backups else "none yet"),
+                ("Restore a file or folder", "files", "" if have_backups else "none yet"),
+                ("Restore whole system onto a new drive", "system", "" if have_backups else "none yet"),
+                ("Open a backup drive (on a live USB)", "open"),
+                ("Schedule", "schedule"),
+                ("Set up / repair", "setup"),
+                ("Quit", "quit"),
+            ]
+            choice = self.menu("Main menu", items, self.status_lines(), index=index)
+            index = next((i for i, item in enumerate(items) if item[1] == choice), index)
+            if choice in (None, "quit"):
+                return
+            getattr(self, f"screen_{choice}")()
+
+    def screen_backup(self):
+        self.in_terminal("Backing up", backup_logged, self.cfg)
+
+    def pick_backup(self, title):
+        stamps = complete_stamps(self.dest / "snapshots")
+        return self.menu(title, [(stamp_label(s), s) for s in stamps], [("Newest first.", curses.A_DIM)])
+
+    def screen_browse(self):
+        stamp = self.pick_backup("Browse backups")
+        if not stamp:
+            return
+        choice = self.menu(stamp_label(stamp), [
+            ("Restore a file or folder from it", "files"),
+            ("Restore the whole system from it", "system"),
+            ("Delete this backup", "delete"),
+        ])
+        if choice == "files":
+            self.screen_files(stamp)
+        elif choice == "system":
+            self.screen_system(stamp)
+        elif choice == "delete" and self.confirm("Delete backup", [f"Delete the backup from {stamp_label(stamp)}?"], yes="Delete"):
+            for sub in SUBVOLUMES:
+                path = self.dest / "snapshots" / f"{sub}.{stamp}"
+                if path.exists():
+                    run(["btrfs", "subvolume", "delete", path], check=False)
+
+    def screen_files(self, stamp=None):
+        stamp = stamp or self.pick_backup("Restore from which backup?")
+        if not stamp:
+            return
+        sub = self.menu("Where was it?", [
+            ("In a home folder (/home)", "@home"),
+            ("Elsewhere on the system (/)", "@"),
+        ])
+        if not sub:
+            return
+        root = self.dest / "snapshots" / f"{sub}.{stamp}"
+        picked = self.browse(root, f"{stamp_label(stamp)}  ·  {SUBVOLUMES[sub]}")
+        if not picked:
+            return
+        original = Path(SUBVOLUMES[sub]) / picked.relative_to(root)
+        mode = "copy"
+        if original.exists():
+            mode = self.menu(f"{original} already exists", [
+                ("Keep both: save the backup copy next to it", "copy"),
+                ("Replace it with the backup copy", "replace"),
+            ])
+            if not mode:
+                return
+        self.in_terminal(f"Restoring {original}", self.restore_and_report, picked, original, mode)
+
+    @staticmethod
+    def restore_and_report(source, original, mode):
+        target = restore_path(source, original, mode)
+        say(f"Restored to {target}")
+
+    def browse(self, root, title):
+        """Pick a file or folder under root. Returns its path or None."""
+        current = root
+        index = 0
+        while True:
+            try:
+                entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir() or p.is_symlink(), p.name.lower()))
+            except OSError as err:
+                self.message(title, [str(err)], self.bad)
+                current = current.parent if current != root else root
+                continue
+            shown = "/" + str(current.relative_to(root)) if current != root else "/"
+            header = [(f"Folder: {shown}", self.accent), ("Enter open · r restore highlighted · ← up · Esc cancel", curses.A_DIM)]
+            items = [(p.name + ("/" if p.is_dir() and not p.is_symlink() else ""), p) for p in entries] or [("(empty)", None, "empty")]
+            top = self.frame(title, header)
+            h, _ = self.scr.getmaxyx()
+            rows = max(1, h - top - 1)
+            index = min(index, len(items) - 1)
+            first = max(0, index - rows + 1)
+            for row, item in enumerate(items[first:first + rows]):
+                i = first + row
+                self.put(top + row, 2, f"{'▸' if i == index else ' '} {item[0]}", curses.A_REVERSE if i == index else 0)
+            self.scr.refresh()
+            key = self.scr.getch()
+            selected = items[index][1]
+            if key in (curses.KEY_UP, ord("k")):
+                index = (index - 1) % len(items)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                index = (index + 1) % len(items)
+            elif key in (curses.KEY_PPAGE,):
+                index = max(0, index - rows)
+            elif key in (curses.KEY_NPAGE,):
+                index = min(len(items) - 1, index + rows)
+            elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and selected:
+                if selected.is_dir() and not selected.is_symlink():
+                    current, index = selected, 0
+                elif key != curses.KEY_RIGHT:
+                    return selected
+            elif key == ord("r") and selected:
+                return selected
+            elif key in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127):
+                if current != root:
+                    previous = current
+                    current = current.parent
+                    names = sorted(current.iterdir(), key=lambda p: (not p.is_dir() or p.is_symlink(), p.name.lower()))
+                    index = names.index(previous) if previous in names else 0
+            elif key in (27, ord("q")):
+                return None
+
+    def screen_system(self, stamp=None):
+        stamp = stamp or self.pick_backup("Restore which backup?")
+        if not stamp:
+            return
+        disks = candidate_disks(self.dest, self.allow_loop)
+        target = self.menu("Restore onto which drive?", [(label, path, reason) for path, label, reason in disks],
+                           [("The drive you pick will be ERASED.", self.bad)])
+        if not target:
+            return
+        name = Path(target).name
+        typed = self.prompt("Confirm", f"Everything on {target} will be erased. Type {name} to continue:")
+        if typed != name:
+            return
+        self.in_terminal(f"Restoring {stamp_label(stamp)} onto {target}", restore_system, self.dest, stamp, target)
+
+    def screen_open(self):
+        data = json.loads(run(["lsblk", "-J", "--tree", "-o", "PATH,SIZE,MODEL,FSTYPE,TYPE,MOUNTPOINTS"]))
+        parts = []
+
+        def walk(devs):
+            for dev in devs:
+                if dev.get("fstype") == "crypto_LUKS" and not dev.get("children"):
+                    parts.append((f"{dev['path']}  {dev.get('size', '')}", dev["path"]))
+                walk(dev.get("children") or [])
+
+        walk(data.get("blockdevices", []))
+        if not parts:
+            self.message("Open a backup drive", ["No locked encrypted drives found."])
+            return
+        device = self.menu("Which drive holds the backups?", parts)
+        if device and self.in_terminal(f"Unlocking {device}", self.open_backup_drive, device):
+            found = WORK / "backup" / "backups" / "system"
+            if (found / "snapshots").is_dir():
+                self.cfg["dest"] = str(found)
+            else:
+                self.message("Open a backup drive", [f"No backups found on {device}."], self.warn)
+
+    def open_backup_drive(self, device):
+        name = "omarchy-backup-source"
+        run(["cryptsetup", "open", "--readonly", device, name], capture=False)
+        (WORK / "backup").mkdir(parents=True, exist_ok=True)
+        run(["mount", "-o", "ro", f"/dev/mapper/{name}", WORK / "backup"])
+        self.opened_backup = name
+        say("Unlocked.")
+
+    def screen_schedule(self):
+        state = schedule_state()
+        if state == "not installed":
+            self.message("Schedule", ["Nightly backups are not installed yet.", "Use Set up / repair → Install first."], self.warn)
+            return
+        choice = self.menu("Schedule", [
+            ("Turn nightly backups off" if state == "on" else "Turn nightly backups on", "toggle"),
+            (f"Change time (now {self.cfg['time']})", "time"),
+        ], [(f"Nightly backups are {state}.", 0)])
+        if choice == "toggle":
+            set_schedule(self.cfg, enabled=state != "on")
+        elif choice == "time":
+            at = self.prompt("Schedule", "Back up every night at (HH:MM, 24-hour):", self.cfg["time"])
+            if at and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+                set_schedule(self.cfg, at=at)
+            elif at is not None:
+                self.message("Schedule", [f"{at!r} is not a time like 03:00."], self.warn)
+
+    def screen_setup(self):
+        device, key_file = backup_drive(self.dest) if self.dest.exists() or self.dest.parent.exists() else (None, None)
+        items = [("Install / update the program and nightly schedule", "install")]
+        if device:
+            label = "Add a password to the backup drive" if keyslot_count(device) < 2 else "Add another password to the backup drive"
+            items.append((label, "password", "" if key_file else "no key file found"))
+        items.append((f"Backup location: {self.dest}", "dest"))
+        choice = self.menu("Set up / repair", items)
+        if choice == "install":
+            self.in_terminal("Installing", install, self.cfg)
+        elif choice == "password":
+            self.in_terminal("Adding a password to the backup drive", self.add_password, device, key_file)
+        elif choice == "dest":
+            path = self.prompt("Backup location", "Folder for backups (must be on a different btrfs drive):", self.cfg["dest"])
+            if path:
+                self.cfg["dest"] = path
+                save_config(self.cfg)
+
+    @staticmethod
+    def add_password(device, key_file):
+        say("This lets you unlock the backup drive by typing a password, for example")
+        say("from a USB stick after the system drive has failed. Type the new password twice.\n")
+        run(["cryptsetup", "luksAddKey", "--key-file", key_file, device], capture=False)
+        say("Password added.")
+
+    def close(self):
+        if self.opened_backup:
+            run(["umount", WORK / "backup"], check=False)
+            run(["cryptsetup", "close", self.opened_backup], check=False)
+
+
+def tui(cfg, allow_loop):
+    os.environ.setdefault("ESCDELAY", "25")
+    holder = {}
+
+    def start(scr):
+        holder["ui"] = UI(scr, cfg, allow_loop)
+        holder["ui"].main()
+
+    try:
+        curses.wrapper(start)
+    finally:
+        if "ui" in holder:
+            holder["ui"].close()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def ensure_root():
+    if os.geteuid() == 0 or os.environ.get("OMARCHY_BACKUP_NO_SUDO"):
+        return
+    os.execvp("sudo", ["sudo", sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=APP, description="Back up and restore an Omarchy system.")
+    parser.add_argument("--allow-loop", action="store_true", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("run", help="run one backup now (used by the nightly timer)")
+    sub.add_parser("list", help="list backups")
+    restore = sub.add_parser("restore-system", help="erase a drive and restore a backup onto it")
+    restore.add_argument("--target", required=True)
+    restore.add_argument("--backup-dir")
+    restore.add_argument("--at", help="backup time, e.g. 20261005T030000 (default: newest)")
+    restore.add_argument("--no-efi-register", action="store_true")
+    restore.add_argument("--luks-key-file")
+    restore.add_argument("--yes", action="store_true")
+    args = parser.parse_args(argv)
+
+    ensure_root()
+    cfg = load_config()
+
+    if args.command == "run":
+        return backup_logged(cfg)
+    if args.command == "list":
+        for stamp in complete_stamps(Path(cfg["dest"]) / "snapshots"):
+            print(f"{stamp}  {stamp_label(stamp)}")
+        return 0
+    if args.command == "restore-system":
+        backup_dir = Path(args.backup_dir or cfg["dest"])
+        stamps = complete_stamps(backup_dir / "snapshots")
+        stamp = args.at or (stamps[0] if stamps else None)
+        if not stamp:
+            print(f"No backups in {backup_dir}", file=sys.stderr)
+            return 1
+        if not args.yes and input(f"Erase {args.target} and restore {stamp}? Type yes: ") != "yes":
+            return 1
+        try:
+            restore_system(backup_dir, stamp, args.target, not args.no_efi_register, args.luks_key_file)
+        except BackupError as err:
+            print(f"Restore failed: {err}", file=sys.stderr)
+            return 1
+        return 0
+
+    tui(cfg, args.allow_loop)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
