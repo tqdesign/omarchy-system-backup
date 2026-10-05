@@ -108,8 +108,14 @@ omarchy-backup restore-system --target /dev/nvmeXn1 [--at 20261005T030000]
 ## Development
 
 ```bash
-python3 -m unittest test_omarchy_backup
+python3 -m unittest test_omarchy_backup   # unit tests
+sudo ./test-restore.sh                     # full restore into a throwaway disk image
 ```
+
+`test-restore.sh` restores the newest backup into a temporary image file next to
+the backups, checks the result (subvolumes, files, fstab, boot settings, rebuilt
+boot image) and deletes the image. Real drives and the firmware boot list are
+not touched.
 
 ## Status
 
