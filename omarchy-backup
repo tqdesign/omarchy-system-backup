@@ -231,35 +231,71 @@ def write_status(dest, started, result, message):
 # ---------------------------------------------------------------------------
 
 
-def copy_subvolume(snapshot, parent, dest_dir, label):
-    """btrfs send | btrfs receive, printing how much has been copied."""
-    send_cmd = ["btrfs", "send", "-q"] + (["-p", str(parent)] if parent else []) + [str(snapshot)]
-    send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
-    recv = subprocess.Popen(["btrfs", "receive", "-q", str(dest_dir)], stdin=subprocess.PIPE)
+def pipe_with_progress(send_cmd, recv_cmd, label):
+    """send_cmd | recv_cmd, printing how much has been copied. If either side
+    fails, the other is stopped instead of being left blocked on the pipe."""
+    send = subprocess.Popen([str(c) for c in send_cmd], stdout=subprocess.PIPE)
+    recv = subprocess.Popen([str(c) for c in recv_cmd], stdin=subprocess.PIPE)
     copied = 0
     started = last_print = time.monotonic()
     try:
         while chunk := send.stdout.read(1 << 20):
-            recv.stdin.write(chunk)
+            try:
+                recv.stdin.write(chunk)
+            except BrokenPipeError:
+                break
             copied += len(chunk)
             now = time.monotonic()
             if now - last_print >= 1:
                 rate = copied / max(now - started, 0.001)
                 print(f"\r   {label}: {human_bytes(copied)} copied ({human_bytes(rate)}/s)   ", end="", flush=True)
                 last_print = now
-    except BrokenPipeError:
-        pass
+    except BaseException:
+        send.kill()
+        recv.kill()
+        raise
     finally:
-        try:
-            recv.stdin.close()
-        except BrokenPipeError:
-            pass
-    send_code = send.wait()
-    recv_code = recv.wait()
+        # Closing both ends makes a still-running side exit (EOF or EPIPE).
+        for stream in (recv.stdin, send.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        send_code = send.wait()
+        recv_code = recv.wait()
     print(f"\r   {label}: {human_bytes(copied)} copied{' ' * 20}", flush=True)
     if send_code or recv_code:
-        raise BackupError(f"copying {label} failed (send {send_code}, receive {recv_code})")
+        raise BackupError(f"copying {label} failed (send exit {send_code}, receive exit {recv_code})")
     return copied
+
+
+def copy_subvolume(snapshot, parent, dest_dir, label):
+    """btrfs send | btrfs receive."""
+    send_cmd = ["btrfs", "send", "-q"] + (["-p", parent] if parent else []) + [snapshot]
+    return pipe_with_progress(send_cmd, ["btrfs", "receive", "-q", dest_dir], label)
+
+
+class NoSleep:
+    """Block idle/requested sleep while a backup or restore runs. Closing the
+    lid still suspends (logind ignores inhibitors for the lid by default)."""
+
+    def __init__(self, why):
+        self.why = why
+        self.proc = None
+
+    def __enter__(self):
+        if shutil.which("systemd-inhibit"):
+            self.proc = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep:idle", f"--who={APP}", f"--why={self.why}",
+                 "--mode=block", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait()
 
 
 def save_restore_kit(dest):
@@ -372,7 +408,8 @@ def backup(cfg):
 def backup_logged(cfg):
     started = dt.datetime.now().isoformat(timespec="seconds")
     try:
-        backup(cfg)
+        with NoSleep("System backup in progress"):
+            backup(cfg)
         return 0
     except (BackupError, KeyboardInterrupt) as err:
         message = "cancelled" if isinstance(err, KeyboardInterrupt) else str(err)
@@ -469,6 +506,11 @@ def candidate_disks(backup_dir, allow_loop=False):
 
 def restore_system(backup_dir, stamp, target, efi_register=True, luks_key_file=None):
     """Erase target and rebuild a bootable system from one backup. Interactive for passwords."""
+    with NoSleep("System restore in progress"):
+        _restore_system(backup_dir, stamp, target, efi_register, luks_key_file)
+
+
+def _restore_system(backup_dir, stamp, target, efi_register, luks_key_file):
     backup_dir = Path(backup_dir)
     snaps = backup_dir / "snapshots"
     for sub in SUBVOLUMES:

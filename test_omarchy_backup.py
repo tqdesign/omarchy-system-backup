@@ -110,6 +110,26 @@ class PathTests(unittest.TestCase):
             self.assertEqual(B.existing_ancestor(tmp), Path(tmp))
 
 
+class PipeTests(unittest.TestCase):
+    def test_copies_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp, "out")
+            n = B.pipe_with_progress(["head", "-c", "5000000", "/dev/zero"], ["sh", "-c", f"cat > {out}"], "test")
+            self.assertEqual(n, 5_000_000)
+            self.assertEqual(out.stat().st_size, 5_000_000)
+
+    def test_receiver_failure_does_not_hang(self):
+        # The receiver quits early; the endless sender must be stopped, not waited on forever.
+        start = B.time.monotonic()
+        with self.assertRaises(B.BackupError):
+            B.pipe_with_progress(["yes"], ["sh", "-c", "head -c 100000 >/dev/null; exit 3"], "test")
+        self.assertLess(B.time.monotonic() - start, 10)
+
+    def test_sender_failure_is_reported(self):
+        with self.assertRaises(B.BackupError):
+            B.pipe_with_progress(["sh", "-c", "echo partial; exit 1"], ["sh", "-c", "cat >/dev/null"], "test")
+
+
 class UnitFileTests(unittest.TestCase):
     def test_timer_and_service(self):
         self.assertIn("OnCalendar=*-*-* 03:00:00", B.timer_text("03:00"))
